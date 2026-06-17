@@ -253,6 +253,79 @@ def pwm_kind2_bipolar_same_phase_parallel(
     )
 
 
+def pwm_kind2_fifo_grouped_multichannel(
+    samples: np.ndarray,
+    config: PwmConfig,
+    samples_per_period: int,
+    channels: int,
+    *,
+    phase_offsets: np.ndarray | None = None,
+    input_bits: int | None = None,
+    normalize_sum: bool = True,
+) -> np.ndarray:
+    """Read several FIFO samples per PWM period and sum them across channels.
+
+    ``samples_per_period`` controls FIFO read throughput. ``channels`` controls
+    how many physical PWM channels are summed. Each FIFO sample gets the same
+    number of channels, so ``channels`` must be an integer multiple of
+    ``samples_per_period``.
+
+    The default channel mapping is ``sample_slot = channel % samples_per_period``.
+    Default phases are evenly distributed across physical channels. The returned
+    waveform is only the summed PWM channel model; it does not include an analog
+    filter, transformer, load, or hardware timing model.
+    """
+    _validate_channels(samples_per_period)
+    _validate_channels(channels)
+    if channels % samples_per_period != 0:
+        raise ValueError("channels must be an integer multiple of samples_per_period")
+    values = _as_unit_values(samples, input_bits)
+    groups = values.size // samples_per_period
+    if groups == 0:
+        return np.array([], dtype=np.float64)
+    grouped = values[: groups * samples_per_period].reshape(groups, samples_per_period)
+    phases = _phase_offsets(channels, phase_offsets)
+    summed = np.zeros((groups, config.period_samples), dtype=np.float64)
+    for ch, phase in enumerate(phases):
+        sample_slot = ch % samples_per_period
+        carrier = triangle_carrier(config.period_samples, phase=float(phase))
+        summed += _compare_pwm(grouped[:, sample_slot, None], carrier[None, :])
+    if normalize_sum:
+        summed /= float(channels)
+    return summed.reshape(-1)
+
+
+def pwm_kind2_bipolar_fifo_grouped_multichannel(
+    samples: np.ndarray,
+    config: PwmConfig,
+    samples_per_period: int,
+    channels: int,
+    *,
+    phase_offsets: np.ndarray | None = None,
+    normalize_sum: bool = True,
+) -> BipolarPwm:
+    """Bipolar grouped FIFO PWM kind 2 summed across physical channels."""
+    positive, negative = _split_signed_magnitude(samples)
+    return BipolarPwm(
+        positive=pwm_kind2_fifo_grouped_multichannel(
+            positive,
+            config,
+            samples_per_period,
+            channels,
+            phase_offsets=phase_offsets,
+            normalize_sum=normalize_sum,
+        ),
+        negative=pwm_kind2_fifo_grouped_multichannel(
+            negative,
+            config,
+            samples_per_period,
+            channels,
+            phase_offsets=phase_offsets,
+            normalize_sum=normalize_sum,
+        ),
+    )
+
+
 def pwm_kind2_phase_interleaved(
     samples: np.ndarray,
     config: PwmConfig,
