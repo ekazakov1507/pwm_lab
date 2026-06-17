@@ -23,12 +23,8 @@ The main use case is comparing PWM kind 1, PWM kind 2, PDM, and one-bit delta-si
 - `analysis.py` - spectra, peak detection, and simple decimation helpers.
 - `experiments.py` - ready scenarios for FIFO-rate, multi-sample PWM kind-2 checks, and PDM/delta-sigma spectra.
 - `__init__.py` - public API exported as `from pwm_lab import ...`.
-
-Scripts in the parent `python` folder:
-
-- `run_fifo_parallel_idea.py` - checks the FIFO/multi-sample PWM kind-2 idea.
-- `run_framework_check.py` - smoke test for all supported PWM variants.
-- `test_pwm_lab.py` - lightweight checks without `pytest`.
+- `plot_pwm_grouped_demo.py` - generates PNG figures for the grouped FIFO PWM strategy.
+- `test_pwm.py`, `test_pdm.py`, `test_delta_sigma.py` - lightweight checks without `pytest`.
 
 ## Signal Conventions
 
@@ -59,6 +55,112 @@ Available input families:
 from pwm_lab import sine_samples, sine_signed
 from pwm_lab import lfm_samples, lfm_signed
 from pwm_lab import lorenz_samples
+```
+
+## Modulation Block Diagrams
+
+These diagrams show the numerical models implemented in the package. They are
+not HDL timing diagrams and do not include power stages, transformers, analog
+filters, loads, or dead time.
+
+PWM kind 1 compares a clock-rate input value with the carrier at every clock
+sample:
+
+```mermaid
+flowchart LR
+    X["clock-rate samples x[n]"] --> CMP["compare x[n] > carrier[n]"]
+    C["triangle carrier at f_pwm"] --> CMP
+    CFG["PwmConfig period_samples"] --> C
+    CMP --> Y["PWM stream at f_clk"]
+```
+
+PWM kind 2 latches one FIFO sample for a full PWM period:
+
+```mermaid
+flowchart LR
+    FIFO["FIFO/data-rate samples x[k]"] --> L["latch one sample per PWM period"]
+    L --> CMP["compare latched value with carrier period"]
+    C["triangle carrier period"] --> CMP
+    CMP --> Y["PWM stream at f_clk"]
+```
+
+Multi-channel PWM sends the same sample to several phase-shifted carriers and
+sums the channel outputs:
+
+```mermaid
+flowchart LR
+    X["sample x[k]"] --> F["fan out to channels"]
+    F --> C0["compare channel 0 phase 0"]
+    F --> C1["compare channel 1 phase 1/channels"]
+    F --> CN["compare channel N phase N/channels"]
+    CARR["phase-shifted carriers"] --> C0
+    CARR --> C1
+    CARR --> CN
+    C0 --> SUM["sum channels"]
+    C1 --> SUM
+    CN --> SUM
+    SUM --> Y["summed PWM"]
+```
+
+Grouped FIFO multi-channel PWM reads several consecutive FIFO samples per PWM
+period, maps them to physical channels, then sums the channel outputs:
+
+```mermaid
+flowchart LR
+    FIFO["FIFO samples x0, x1, x2, ..."] --> G["group by samples_per_period"]
+    G --> M["channel mapping sample_slot = channel % samples_per_period"]
+    M --> CH0["channel 0: x0, phase 0/channels"]
+    M --> CH1["channel 1: x1, phase 1/channels"]
+    M --> CH2["channel 2: x0, phase 2/channels"]
+    M --> CH3["channel 3: x1, phase 3/channels"]
+    CH0 --> SUM["sum physical PWM channels"]
+    CH1 --> SUM
+    CH2 --> SUM
+    CH3 --> SUM
+    SUM --> Y["raw or normalized multi-level PWM"]
+```
+
+First-order PDM and first-order unipolar delta-sigma use a one-bit accumulator
+loop for normalized samples:
+
+```mermaid
+flowchart LR
+    X["normalized sample x[n]"] --> A["accumulator state += x[n]"]
+    A --> Q["emit 1 if state >= 1 else 0"]
+    Q --> FB["if emitted 1, subtract 1 from state"]
+    FB --> A
+    Q --> Y["one-bit output stream"]
+```
+
+Second-order PDM and second-order unipolar delta-sigma use two error-feedback
+states and a one-bit quantizer:
+
+```mermaid
+flowchart LR
+    X["normalized sample x[n]"] --> E1["state1 += x[n] - previous_output"]
+    E1 --> E2["state2 += state1 - previous_output"]
+    E2 --> Q["quantize by sign of state2"]
+    Q --> Y["one-bit output stream"]
+    Q --> P["previous_output"]
+    P --> E1
+    P --> E2
+```
+
+Bipolar helpers split a signed input into positive and negative unipolar
+branches, run the selected modulator on both branches, then expose the
+differential result:
+
+```mermaid
+flowchart LR
+    X["signed sample x[n] in [-1, 1]"] --> S["split signed magnitude"]
+    S --> P["positive = max(x, 0)"]
+    S --> N["negative = max(-x, 0)"]
+    P --> MP["selected PWM/PDM/delta-sigma modulator"]
+    N --> MN["selected PWM/PDM/delta-sigma modulator"]
+    MP --> POS["positive output"]
+    MN --> NEG["negative output"]
+    POS --> D["differential = positive - negative"]
+    NEG --> D
 ```
 
 ## PWM Configuration
@@ -291,7 +393,10 @@ By default, phases are evenly distributed:
 
 ## PWM Kind 2 With Several FIFO Samples Per Period
 
-This is the architecture used to check the idea:
+This section models PWM kind 2 variants where FIFO samples arrive at a data
+rate that can be higher than the PWM update rate.
+
+The basic grouped FIFO idea is:
 
 ```text
 period 1: channel 1 <- x0, channel 2 <- x1, channel 3 <- x2, ...
@@ -314,6 +419,133 @@ from pwm_lab import pwm_kind2_phase_interleaved
 y = pwm_kind2_phase_interleaved(samples_from_fifo, config, channels=5)
 ```
 
+### Grouped FIFO Samples Across More Channels
+
+Use `pwm_kind2_fifo_grouped_multichannel(...)` when FIFO read throughput and
+the number of summed physical PWM channels are different design choices:
+
+```python
+from pwm_lab import pwm_kind2_fifo_grouped_multichannel
+
+y = pwm_kind2_fifo_grouped_multichannel(
+    samples_from_fifo,
+    config,
+    samples_per_period=2,
+    channels=4,
+)
+```
+
+The key parameters are:
+
+```text
+samples_per_period   how many consecutive FIFO samples are read per PWM period
+channels             how many physical PWM channels are summed
+```
+
+The FIFO read rate is:
+
+```text
+fifo_read_rate = samples_per_period * config.actual_f_pwm
+```
+
+The number of channel copies per FIFO sample is:
+
+```text
+channels_per_fifo_sample = channels // samples_per_period
+```
+
+The grouped multi-channel mapping is:
+
+```text
+period 1: channel 0 <- x0, channel 1 <- x1, channel 2 <- x0, channel 3 <- x1
+period 2: channel 0 <- x2, channel 1 <- x3, channel 2 <- x2, channel 3 <- x3
+```
+
+In code, the default mapping is:
+
+```text
+sample_slot(channel) = channel % samples_per_period
+phase(channel)       = channel / channels
+```
+
+`channels` must be an integer multiple of `samples_per_period`, so each FIFO
+sample in the group gets the same number of physical channels.
+
+By default, physical channel phases are evenly distributed. Pass explicit
+`phase_offsets` to model another channel phase plan. For example, all-zero
+offsets model same-phase summing:
+
+```python
+import numpy as np
+
+y = pwm_kind2_fifo_grouped_multichannel(
+    samples_from_fifo,
+    config,
+    samples_per_period=2,
+    channels=4,
+    phase_offsets=np.zeros(4),
+)
+```
+
+`normalize_sum=False` returns the raw summed multi-level PWM values from
+`0` to `channels`. The default normalizes the summed output by `channels`.
+
+The output length is:
+
+```text
+floor(len(samples_from_fifo) / samples_per_period) * config.period_samples
+```
+
+Any incomplete tail group is ignored, matching the other grouped FIFO helpers.
+The function models only numerical summing of PWM channel outputs. It does not
+model a transformer, analog filter, load, dead time, gate driver timing, or
+hardware FIFO timing.
+
+Generate visualization figures:
+
+```powershell
+python plot_pwm_grouped_demo.py
+```
+
+This creates:
+
+```text
+figures/pwm_grouped_mapping.png
+figures/pwm_grouped_waveform.png
+figures/pwm_grouped_time_realization.png
+figures/pwm_grouped_spectrum.png
+```
+
+The figures show only the numerical channel summing model. They do not model a
+transformer, analog filter, or demodulator.
+
+Useful visualization options:
+
+```powershell
+python plot_pwm_grouped_demo.py --samples-per-period 2 --channels 4
+python plot_pwm_grouped_demo.py --samples-per-period 4 --channels 8 --groups 12
+python plot_pwm_grouped_demo.py --output-dir figures/demo --period-samples 128
+```
+
+The mapping figure shows which FIFO sample drives each physical PWM channel.
+The waveform figure shows input samples, raw summed PWM levels, normalized
+summed PWM, and PWM-period averages.
+
+The time realization figure shows individual physical PWM channels, their raw
+sum, and the normalized summed waveform against the FIFO group average.
+
+The spectrum figure has two parts:
+
+```text
+low-frequency envelope spectrum
+summed PWM spectrum
+```
+
+Frequencies are normalized to `f_pwm`. The low-frequency panel compares the
+FIFO group-average spectrum with the average of the generated PWM periods. The
+summed PWM panel shows the spectral content of the normalized multi-level PWM
+before any external filtering.
+
 Interpretation:
 
 - same-phase parallel channels read several FIFO samples during one PWM period and combine them;
@@ -321,6 +553,7 @@ Interpretation:
 - it does not replay every input sample as a separate time instant;
 - it is acceptable only when bandwidth and decimation effects are understood;
 - phase-shifted carriers change the high-frequency ripple structure, but this model is still a summed multi-channel PWM model.
+- grouped multi-channel PWM separates FIFO read throughput (`samples_per_period * f_pwm`) from the number of summed physical channels.
 
 For `f_data = 1 MHz` and `f_pwm = 200 kHz`, at least five channels are needed to read FIFO data without backlog:
 
@@ -451,22 +684,17 @@ For delta-sigma, `sample_rate` is the modulator input/output data rate. Do not u
 
 ## Quick Checks
 
-Run the package-local PDM and delta-sigma checks from the `pwm_lab` folder:
+Run the smoke checks:
 
 ```powershell
+python test_pwm.py
 python test_pdm.py
 python test_delta_sigma.py
+python plot_pwm_grouped_demo.py
+python -m compileall analysis.py pwm.py pdm.py delta_sigma.py signals.py experiments.py __init__.py plot_pwm_grouped_demo.py test_pwm.py test_pdm.py test_delta_sigma.py
 ```
 
-Run the broader smoke checks from the parent `python` folder:
-
-```powershell
-python test_pwm_lab.py
-python run_fifo_parallel_idea.py
-python run_framework_check.py
-```
-
-Expected FIFO sanity result:
+The `simulate_fifo_parallel_idea()` helper should produce this FIFO sanity result:
 
 ```text
 one_channel         -> about 4 kHz
