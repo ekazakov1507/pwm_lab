@@ -7,6 +7,8 @@ The main use case is comparing PWM kind 1, PWM kind 2, PDM, and one-bit delta-si
 
 - unipolar PWM;
 - bipolar PWM with `positive`, `negative`, and `differential` outputs;
+- bridge PWM for IBV-style `plus` / `minus` physical outputs with `regular`,
+  `bipolar`, and `three_level` modes;
 - multi-channel PWM with phase-shifted carriers;
 - PWM kind 2 with several FIFO samples processed during one PWM period;
 - first-order and second-order PDM with unipolar, bipolar, and multi-channel helpers;
@@ -17,7 +19,7 @@ The main use case is comparing PWM kind 1, PWM kind 2, PDM, and one-bit delta-si
 ## Files
 
 - `signals.py` - input signal generators and normalization helpers.
-- `pwm.py` - PWM models and multi-channel variants.
+- `pwm.py` - PWM models, bridge plus/minus outputs, and multi-channel variants.
 - `pdm.py` - first-order and second-order PDM models and multi-channel variants.
 - `delta_sigma.py` - first-order and second-order one-bit delta-sigma models, multi-channel variants, and FIFO/channel strategies.
 - `analysis.py` - spectra, peak detection, and simple decimation helpers.
@@ -373,6 +375,55 @@ b1.differential
 
 The positive branch is active only for positive input values.
 The negative branch is active only for negative input values.
+
+## Bridge PWM For IBV Plus/Minus Outputs
+
+Use bridge PWM helpers when the model must expose physical `plus` and `minus`
+PWM outputs. These helpers accept signed input values in `[-1, 1]` and return a
+single `BridgePwm` object:
+
+```python
+from pwm_lab import pwm_kind1_bridge, pwm_kind2_bridge_latched
+
+b1 = pwm_kind1_bridge(signed_samples_at_clk, config, mode="three_level")
+b2 = pwm_kind2_bridge_latched(signed_samples_from_fifo, config, mode="three_level")
+```
+
+The result is compatible with the existing bipolar-output framework:
+
+```python
+b2.plus
+b2.minus
+b2.differential
+
+# Compatibility aliases used by spectra_for_waveforms(...)
+b2.positive
+b2.negative
+```
+
+Supported bridge modes are:
+
+```text
+regular      plus = input compared with signed carrier, minus = inverse
+bipolar      regular comparison, then gate plus/minus by the sign of input
+three_level  compare abs(input) with a 0..1 carrier, then gate by sign
+```
+
+In `regular` mode one of the two outputs is active at each clock sample. In
+`bipolar` and `three_level` modes both outputs are off at zero input. The
+default bridge mode is `three_level`, matching the split-magnitude convention
+used by the older `pwm_kind*_bipolar(...)` helpers.
+
+Bridge helpers are available for the PWM kind-2 grouping strategies too:
+
+```python
+from pwm_lab import (
+    pwm_kind2_bridge_multichannel_latched,
+    pwm_kind2_bridge_same_phase_parallel,
+    pwm_kind2_bridge_phase_interleaved,
+    pwm_kind2_bridge_fifo_grouped_multichannel,
+)
+```
 
 ## Multi-Channel PWM
 

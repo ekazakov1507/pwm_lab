@@ -6,6 +6,7 @@ import numpy as np
 
 from ._modulation import (
     BipolarOutput,
+    as_signed_values as _as_signed_values,
     as_unit_values as _as_unit_values,
     phase_offsets as _phase_offsets,
     split_signed_magnitude as _split_signed_magnitude,
@@ -55,6 +56,18 @@ class BipolarPwm(BipolarOutput):
     """Two-output PWM representation for a signed signal."""
 
 
+class BridgePwm(BipolarPwm):
+    """Physical plus/minus PWM output pair for bridge-style models."""
+
+    @property
+    def plus(self) -> np.ndarray:
+        return self.positive
+
+    @property
+    def minus(self) -> np.ndarray:
+        return self.negative
+
+
 def triangle_carrier(period_samples: int, *, phase: float = 0.0) -> np.ndarray:
     """Generate one normalized triangular carrier period in [0, 1]."""
     if period_samples < 4:
@@ -68,6 +81,38 @@ def triangle_carrier(period_samples: int, *, phase: float = 0.0) -> np.ndarray:
 def _compare_pwm(values: np.ndarray, carrier: np.ndarray) -> np.ndarray:
     """PWM compare where 0 duty is always off and 1 duty is always on."""
     return ((values > carrier) | (values >= 1.0)).astype(np.float64)
+
+
+def _validate_bridge_mode(mode: str) -> str:
+    if mode not in {"regular", "bipolar", "three_level"}:
+        raise ValueError("mode must be 'regular', 'bipolar', or 'three_level'")
+    return mode
+
+
+def _bridge_compare_pwm(
+    signed_values: np.ndarray,
+    carrier: np.ndarray,
+    mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    values = _as_signed_values(signed_values)
+    selected_mode = _validate_bridge_mode(mode)
+
+    if selected_mode in {"regular", "bipolar"}:
+        duty = 0.5 * (values + 1.0)
+        regular_plus = _compare_pwm(duty, carrier) > 0.0
+        regular_minus = ~regular_plus
+        if selected_mode == "regular":
+            return regular_plus.astype(np.float64), regular_minus.astype(np.float64)
+        return (
+            (regular_plus & (values > 0.0)).astype(np.float64),
+            (regular_minus & (values < 0.0)).astype(np.float64),
+        )
+
+    pulse = _compare_pwm(np.abs(values), carrier) > 0.0
+    return (
+        (pulse & (values > 0.0)).astype(np.float64),
+        (pulse & (values < 0.0)).astype(np.float64),
+    )
 
 
 def pwm_kind1(samples_at_clk: np.ndarray, config: PwmConfig, *, phase: float = 0.0) -> np.ndarray:
@@ -94,6 +139,45 @@ def pwm_kind1_multichannel(
     if normalize_sum:
         summed /= float(channels)
     return summed
+
+
+def pwm_kind1_bridge(
+    samples_at_clk: np.ndarray,
+    config: PwmConfig,
+    *,
+    mode: str = "three_level",
+    phase: float = 0.0,
+) -> BridgePwm:
+    """PWM kind 1 with physical plus/minus outputs for signed values in [-1, 1]."""
+    values = _as_signed_values(samples_at_clk)
+    carrier = triangle_carrier(config.period_samples, phase=phase)
+    tiled = np.resize(carrier, values.size)
+    plus, minus = _bridge_compare_pwm(values, tiled, mode)
+    return BridgePwm(positive=plus, negative=minus)
+
+
+def pwm_kind1_bridge_multichannel(
+    samples_at_clk: np.ndarray,
+    config: PwmConfig,
+    channels: int,
+    *,
+    mode: str = "three_level",
+    phase_offsets: np.ndarray | None = None,
+    normalize_sum: bool = True,
+) -> BridgePwm:
+    """PWM kind 1 bridge outputs with phase-shifted carriers summed across channels."""
+    values = np.asarray(samples_at_clk, dtype=np.float64)
+    phases = _phase_offsets(channels, phase_offsets)
+    plus_sum = np.zeros_like(values, dtype=np.float64)
+    minus_sum = np.zeros_like(values, dtype=np.float64)
+    for phase in phases:
+        bridge = pwm_kind1_bridge(values, config, mode=mode, phase=float(phase))
+        plus_sum += bridge.plus
+        minus_sum += bridge.minus
+    if normalize_sum:
+        plus_sum /= float(channels)
+        minus_sum /= float(channels)
+    return BridgePwm(positive=plus_sum, negative=minus_sum)
 
 
 def pwm_kind1_bipolar(samples_at_clk: np.ndarray, config: PwmConfig, *, phase: float = 0.0) -> BipolarPwm:
@@ -167,6 +251,45 @@ def pwm_kind2_multichannel_latched(
     return summed.reshape(-1)
 
 
+def pwm_kind2_bridge_latched(
+    samples: np.ndarray,
+    config: PwmConfig,
+    *,
+    mode: str = "three_level",
+    phase: float = 0.0,
+) -> BridgePwm:
+    """PWM kind 2 bridge outputs: one signed sample is latched for one full PWM period."""
+    values = _as_signed_values(samples)
+    carrier = triangle_carrier(config.period_samples, phase=phase)
+    plus, minus = _bridge_compare_pwm(values[:, None], carrier[None, :], mode)
+    return BridgePwm(positive=plus.reshape(-1), negative=minus.reshape(-1))
+
+
+def pwm_kind2_bridge_multichannel_latched(
+    samples: np.ndarray,
+    config: PwmConfig,
+    channels: int,
+    *,
+    mode: str = "three_level",
+    phase_offsets: np.ndarray | None = None,
+    normalize_sum: bool = True,
+) -> BridgePwm:
+    """PWM kind 2 bridge outputs with phase-shifted carriers reading the same sample."""
+    values = _as_signed_values(samples)
+    phases = _phase_offsets(channels, phase_offsets)
+    plus_sum = np.zeros((values.size, config.period_samples), dtype=np.float64)
+    minus_sum = np.zeros((values.size, config.period_samples), dtype=np.float64)
+    for phase in phases:
+        carrier = triangle_carrier(config.period_samples, phase=float(phase))
+        plus, minus = _bridge_compare_pwm(values[:, None], carrier[None, :], mode)
+        plus_sum += plus
+        minus_sum += minus
+    if normalize_sum:
+        plus_sum /= float(channels)
+        minus_sum /= float(channels)
+    return BridgePwm(positive=plus_sum.reshape(-1), negative=minus_sum.reshape(-1))
+
+
 def pwm_kind2_bipolar_latched(
     samples: np.ndarray,
     config: PwmConfig,
@@ -238,6 +361,35 @@ def pwm_kind2_same_phase_parallel(
     return summed.reshape(-1)
 
 
+def pwm_kind2_bridge_same_phase_parallel(
+    samples: np.ndarray,
+    config: PwmConfig,
+    channels: int,
+    *,
+    mode: str = "three_level",
+    normalize_sum: bool = True,
+) -> BridgePwm:
+    """Read several FIFO samples per PWM period and form summed bridge PWM outputs."""
+    _validate_channels(channels)
+    values = _as_signed_values(samples)
+    groups = values.size // channels
+    if groups == 0:
+        empty = np.array([], dtype=np.float64)
+        return BridgePwm(positive=empty, negative=empty)
+    grouped = values[: groups * channels].reshape(groups, channels)
+    carrier = triangle_carrier(config.period_samples)
+    plus_sum = np.zeros((groups, config.period_samples), dtype=np.float64)
+    minus_sum = np.zeros((groups, config.period_samples), dtype=np.float64)
+    for ch in range(channels):
+        plus, minus = _bridge_compare_pwm(grouped[:, ch, None], carrier[None, :], mode)
+        plus_sum += plus
+        minus_sum += minus
+    if normalize_sum:
+        plus_sum /= float(channels)
+        minus_sum /= float(channels)
+    return BridgePwm(positive=plus_sum.reshape(-1), negative=minus_sum.reshape(-1))
+
+
 def pwm_kind2_bipolar_same_phase_parallel(
     samples: np.ndarray,
     config: PwmConfig,
@@ -293,6 +445,42 @@ def pwm_kind2_fifo_grouped_multichannel(
     if normalize_sum:
         summed /= float(channels)
     return summed.reshape(-1)
+
+
+def pwm_kind2_bridge_fifo_grouped_multichannel(
+    samples: np.ndarray,
+    config: PwmConfig,
+    samples_per_period: int,
+    channels: int,
+    *,
+    mode: str = "three_level",
+    phase_offsets: np.ndarray | None = None,
+    normalize_sum: bool = True,
+) -> BridgePwm:
+    """Grouped FIFO PWM kind 2 with summed bridge plus/minus outputs."""
+    _validate_channels(samples_per_period)
+    _validate_channels(channels)
+    if channels % samples_per_period != 0:
+        raise ValueError("channels must be an integer multiple of samples_per_period")
+    values = _as_signed_values(samples)
+    groups = values.size // samples_per_period
+    if groups == 0:
+        empty = np.array([], dtype=np.float64)
+        return BridgePwm(positive=empty, negative=empty)
+    grouped = values[: groups * samples_per_period].reshape(groups, samples_per_period)
+    phases = _phase_offsets(channels, phase_offsets)
+    plus_sum = np.zeros((groups, config.period_samples), dtype=np.float64)
+    minus_sum = np.zeros((groups, config.period_samples), dtype=np.float64)
+    for ch, phase in enumerate(phases):
+        sample_slot = ch % samples_per_period
+        carrier = triangle_carrier(config.period_samples, phase=float(phase))
+        plus, minus = _bridge_compare_pwm(grouped[:, sample_slot, None], carrier[None, :], mode)
+        plus_sum += plus
+        minus_sum += minus
+    if normalize_sum:
+        plus_sum /= float(channels)
+        minus_sum /= float(channels)
+    return BridgePwm(positive=plus_sum.reshape(-1), negative=minus_sum.reshape(-1))
 
 
 def pwm_kind2_bipolar_fifo_grouped_multichannel(
@@ -351,6 +539,35 @@ def pwm_kind2_phase_interleaved(
     if normalize_sum:
         summed /= float(channels)
     return summed.reshape(-1)
+
+
+def pwm_kind2_bridge_phase_interleaved(
+    samples: np.ndarray,
+    config: PwmConfig,
+    channels: int,
+    *,
+    mode: str = "three_level",
+    normalize_sum: bool = True,
+) -> BridgePwm:
+    """Read several FIFO samples per PWM period using phase-shifted bridge carriers."""
+    _validate_channels(channels)
+    values = _as_signed_values(samples)
+    groups = values.size // channels
+    if groups == 0:
+        empty = np.array([], dtype=np.float64)
+        return BridgePwm(positive=empty, negative=empty)
+    grouped = values[: groups * channels].reshape(groups, channels)
+    plus_sum = np.zeros((groups, config.period_samples), dtype=np.float64)
+    minus_sum = np.zeros((groups, config.period_samples), dtype=np.float64)
+    for ch in range(channels):
+        carrier = triangle_carrier(config.period_samples, phase=ch / channels)
+        plus, minus = _bridge_compare_pwm(grouped[:, ch, None], carrier[None, :], mode)
+        plus_sum += plus
+        minus_sum += minus
+    if normalize_sum:
+        plus_sum /= float(channels)
+        minus_sum /= float(channels)
+    return BridgePwm(positive=plus_sum.reshape(-1), negative=minus_sum.reshape(-1))
 
 
 def pwm_kind2_bipolar_phase_interleaved(
