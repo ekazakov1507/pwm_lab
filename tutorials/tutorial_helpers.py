@@ -301,6 +301,103 @@ def grouped_fifo_channel_waveforms(
     return traces.reshape(channels, -1), grouped
 
 
+def plot_grouped_fifo_channel_comparison(
+    samples: np.ndarray,
+    config,
+    *,
+    samples_per_period: int,
+    channels: int,
+    phase_offsets: np.ndarray | None = None,
+    max_periods: int = 8,
+    input_scale: float = 255.0,
+    title: str = "Grouped FIFO PWM per-channel comparison",
+) -> tuple[plt.Figure, np.ndarray]:
+    values = np.asarray(samples, dtype=np.float64)
+    groups = values.size // samples_per_period
+    grouped = values[: groups * samples_per_period].reshape(groups, samples_per_period)
+    periods = min(groups, max_periods)
+    if periods <= 0:
+        raise ValueError("at least one complete FIFO group is required")
+
+    if phase_offsets is None:
+        phases = np.arange(channels, dtype=np.float64) / float(channels)
+    else:
+        phases = np.asarray(phase_offsets, dtype=np.float64)
+        if phases.size != channels:
+            raise ValueError("phase_offsets must have one value per channel")
+
+    points = periods * config.period_samples
+    t = time_us(config.f_clk, points)
+    period_edges = np.arange(periods + 1, dtype=np.float64) * config.period_samples / float(config.f_clk) * 1e6
+
+    fig, axes = plt.subplots(
+        channels * 2,
+        1,
+        figsize=(11.0, max(5.8, 1.85 * channels + 1.4)),
+        sharex=True,
+        constrained_layout=True,
+    )
+    axes = np.atleast_1d(axes)
+    fig.suptitle(title)
+
+    for ch, phase in enumerate(phases):
+        sample_slot = ch % samples_per_period
+        sample_indices = np.arange(periods) * samples_per_period + sample_slot
+        channel_samples = grouped[:periods, sample_slot]
+        carrier_one = triangle_carrier(config.period_samples, phase=float(phase))
+        carrier = np.tile(carrier_one, periods)
+        latched = np.repeat(channel_samples, config.period_samples)
+        output = ((latched > carrier) | (latched >= 1.0)).astype(np.float64)
+
+        top = axes[2 * ch]
+        bottom = axes[2 * ch + 1]
+
+        top.plot(t, carrier * input_scale, color="C0", linewidth=1.1, label="carrier")
+        top.step(
+            period_edges,
+            np.r_[channel_samples, channel_samples[-1]] * input_scale,
+            where="post",
+            color="C1",
+            linewidth=1.4,
+            label="latched FIFO sample",
+        )
+        top.plot(
+            period_edges[:-1],
+            channel_samples * input_scale,
+            "o",
+            color="C1",
+            markersize=3.5,
+            label="FIFO read",
+        )
+        for x_pos, sample_index, sample_value in zip(period_edges[:-1], sample_indices, channel_samples):
+            top.annotate(
+                f"x{sample_index}",
+                xy=(x_pos, sample_value * input_scale),
+                xytext=(3, 4),
+                textcoords="offset points",
+                fontsize=7,
+                color="C1",
+            )
+
+        top.set_ylabel(f"ch {ch}\ncode")
+        top.set_ylim(-0.05 * input_scale, 1.08 * input_scale)
+        top.set_title(f"ch {ch}: FIFO slot {sample_slot}, carrier phase {phase:.2f}", fontsize=10)
+        if ch == 0:
+            top.legend(loc="upper right", ncols=3, fontsize=8)
+
+        bottom.step(t, output, where="post", color=f"C{ch % 10}", linewidth=1.1)
+        bottom.set_ylabel("output")
+        bottom.set_ylim(-0.15, 1.15)
+        bottom.set_yticks([0.0, 1.0])
+
+        for ax in (top, bottom):
+            for edge in period_edges:
+                ax.axvline(edge, color="black", alpha=0.12, linewidth=0.8)
+
+    axes[-1].set_xlabel("time, us")
+    return fig, axes
+
+
 def show_grouped_mapping(samples_per_period: int, channels: int, groups: int = 4) -> tuple[plt.Figure, plt.Axes]:
     sample_index = np.zeros((channels, groups), dtype=int)
     sample_slot = np.zeros((channels, groups), dtype=int)
